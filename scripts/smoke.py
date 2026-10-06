@@ -207,7 +207,9 @@ def main() -> int:
         context=f"got {window}",
     )
 
-    late = reading(eid("a4"), "alpha", alpha_seq + 3, 120, 50.0)
+    # a far-ahead seq keeps this rejected reading from ever claiming a
+    # sequence number that later scenario readings legitimately use
+    late = reading(eid("a4"), "alpha", alpha_seq + 100, 120, 50.0)
     status, _, body = req("POST", "/readings", late)
     check(
         status == 409 and body.get("error") == "window_sealed",
@@ -220,9 +222,38 @@ def main() -> int:
         "rejected late reading leaves the published summary untouched",
     )
 
+    # -- 2b. irradiation event rollup ---------------------------------------
+    # an ELEVATED window followed by an empty (NORMAL) window: the two seal
+    # into one ended event covering exactly the non-NORMAL window
+    req("POST", "/readings", reading(eid("a5"), "alpha", alpha_seq + 3, 310, 50.0))
+    req("POST", "/readings", reading(eid("b3"), "beta", beta_seq + 2, 320, 5.0))
+    req("POST", "/readings", reading(eid("a6"), "alpha", alpha_seq + 4, 980, 1.0))
+    status, _, ack = req("POST", "/readings", reading(eid("b4"), "beta", beta_seq + 3, 990, 1.0))
+    check(status == 200, "rollup-driving readings accepted", context=f"got {status} {ack}")
+
+    w1_start = iso(base_ms + 300_000)
+    status, _, events_body = req("GET", "/events")
+    mine = [e for e in events_body.get("events", []) if e.get("start_window") == w1_start]
+    ev = mine[0] if mine else {}
+    check(
+        status == 200
+        and len(mine) == 1
+        and ev.get("status") == "ended"
+        and ev.get("end_window") == w1_start
+        and ev.get("window_count") == 1
+        and ev.get("total_dose") == 65.0  # a3 + b2 + a5 + b3 all land in this window
+        and ev.get("peak_dose") == 50.0
+        and ev.get("max_level") == "ELEVATED"
+        and ev.get("ended_by_window") == iso(base_ms + 600_000)
+        and [w["window_start"] for w in ev.get("windows", [])] == [w1_start],
+        "non-NORMAL window rolls up into a single ended irradiation event",
+        context=f"got {events_body}",
+    )
+
     # -- 3. recovery --------------------------------------------------------
     saved_window = window_after
     saved_ack = ack1
+    saved_event = ev
     try:
         restart_app_container()
         restarted = wait_healthy()
@@ -248,8 +279,17 @@ def main() -> int:
             status == 409 and body.get("error") == "window_sealed",
             "sealed window still rejects late data after restart",
         )
+        status, _, events_after = req("GET", "/events")
+        mine_after = [
+            e for e in events_after.get("events", []) if e.get("start_window") == w1_start
+        ]
+        check(
+            status == 200 and mine_after == [saved_event],
+            "irradiation event identical after restart",
+            context=f"got {events_after}",
+        )
         status, _, state = req("GET", "/state")
-        expected_wm = iso(base_ms + 370_000 - lateness_ms)
+        expected_wm = iso(base_ms + 980_000 - lateness_ms)
         check(
             status == 200 and state.get("watermark") == expected_wm,
             "watermark recovered from persistent state",

@@ -17,6 +17,12 @@ Invariants enforced here:
   key, so concurrent submissions and restarts leave exactly one record.
 * Immutability — a reading whose observation falls into an already
   sealed window is rejected and changes nothing.
+* Irradiation events — each freshly sealed window advances the unique
+  open event inside the same transaction: an ELEVATED or CRITICAL window
+  creates or extends it, the next sealed NORMAL window (including empty
+  windows the watermark stepped over) ends it.  Every window seals
+  exactly once, so the accumulated event record is written exactly once;
+  ended events are never rewritten by late data, replays, or reads.
 """
 from __future__ import annotations
 
@@ -306,6 +312,7 @@ class Engine:
                 now_ms,
             ),
         )
+        self._advance_event(conn, window_start, level, total, peak, now_ms)
         return {
             "window_start": iso(window_start),
             "window_end": iso(window_start + s.window_ms),
@@ -314,6 +321,59 @@ class Engine:
             "peak_dose": peak,
             "event_count": len(rows),
         }
+
+    # --------------------------------------------------------- event rollup
+
+    def _advance_event(
+        self,
+        conn,
+        window_start: int,
+        level: str,
+        total: float,
+        peak: float,
+        now_ms: int,
+    ) -> None:
+        """Fold one freshly sealed window into the irradiation-event stream.
+
+        Adjacent non-NORMAL windows merge into a single event: an ELEVATED
+        or CRITICAL window creates the unique open event or extends it by
+        one window, and the next sealed NORMAL window — including an empty
+        window the watermark stepped over — closes it.  Windows seal in
+        ascending, gap-free order and each seals exactly once, so every
+        window contributes to the event record exactly once; an ended
+        event is never touched again.
+        """
+        open_event = conn.execute(
+            "SELECT * FROM irradiation_events WHERE status = 'ongoing'"
+        ).fetchone()
+        if level == "NORMAL":
+            if open_event is not None:
+                conn.execute(
+                    "UPDATE irradiation_events SET status = 'ended',"
+                    " ended_by_window_ms = ?, updated_at_ms = ?"
+                    " WHERE event_id = ?",
+                    (window_start, now_ms, open_event["event_id"]),
+                )
+            return
+        if open_event is None:
+            conn.execute(
+                "INSERT INTO irradiation_events (start_window_ms, end_window_ms,"
+                " window_count, total_dose, peak_dose, max_level, status,"
+                " ended_by_window_ms, created_at_ms, updated_at_ms)"
+                " VALUES (?,?,?,?,?,?, 'ongoing', NULL, ?, ?)",
+                (window_start, window_start, 1, total, peak, level, now_ms, now_ms),
+            )
+            return
+        max_level = open_event["max_level"]
+        if LEVELS.index(level) > LEVELS.index(max_level):
+            max_level = level
+        conn.execute(
+            "UPDATE irradiation_events SET end_window_ms = ?,"
+            " window_count = window_count + 1, total_dose = total_dose + ?,"
+            " peak_dose = MAX(peak_dose, ?), max_level = ?, updated_at_ms = ?"
+            " WHERE event_id = ?",
+            (window_start, total, peak, max_level, now_ms, open_event["event_id"]),
+        )
 
     def _level(self, total: float, peak: float) -> str:
         s = self.settings
@@ -459,6 +519,55 @@ class Engine:
             }
             for r in rows
         ]
+
+    def list_events(self, since_ms: int | None, until_ms: int | None) -> list[dict]:
+        """Irradiation events, stably sorted by event start (start_window_ms
+        is unique), each with its constituent sealed windows."""
+        query = "SELECT * FROM irradiation_events"
+        clauses, params = [], []
+        if since_ms is not None:
+            clauses.append("start_window_ms >= ?")
+            params.append(since_ms)
+        if until_ms is not None:
+            clauses.append("start_window_ms <= ?")
+            params.append(until_ms)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY start_window_ms"
+        with self.storage.read_txn() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [self._event_json(conn, r) for r in rows]
+
+    def _event_json(self, conn, row) -> dict:
+        windows = conn.execute(
+            "SELECT window_start_ms, window_end_ms, level, total_dose, peak_dose,"
+            " event_count FROM windows"
+            " WHERE window_start_ms >= ? AND window_start_ms <= ?"
+            " ORDER BY window_start_ms",
+            (row["start_window_ms"], row["end_window_ms"]),
+        ).fetchall()
+        return {
+            "event_id": row["event_id"],
+            "start_window": iso(row["start_window_ms"]),
+            "end_window": iso(row["end_window_ms"]),
+            "window_count": row["window_count"],
+            "total_dose": row["total_dose"],
+            "peak_dose": row["peak_dose"],
+            "max_level": row["max_level"],
+            "status": row["status"],
+            "ended_by_window": iso(row["ended_by_window_ms"]),
+            "windows": [
+                {
+                    "window_start": iso(w["window_start_ms"]),
+                    "window_end": iso(w["window_end_ms"]),
+                    "level": w["level"],
+                    "total_dose": w["total_dose"],
+                    "peak_dose": w["peak_dose"],
+                    "event_count": w["event_count"],
+                }
+                for w in windows
+            ],
+        }
 
     def state(self) -> dict:
         with self.storage.read_txn() as conn:

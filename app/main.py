@@ -69,6 +69,20 @@ def create_app(settings: Settings) -> FastAPI:
             )
         }
 
+    @app.get("/events")
+    def list_events(since: AwareDatetime | None = None, until: AwareDatetime | None = None):
+        """List irradiation events — runs of adjacent non-NORMAL sealed
+        windows merged into one continuous event — stably sorted by event
+        start, each with its constituent windows.  ``status`` is
+        ``ongoing`` while the event is still accruing windows and
+        ``ended`` once a sealed NORMAL window has closed it."""
+        return {
+            "events": engine.list_events(
+                to_ms(since) if since else None,
+                to_ms(until) if until else None,
+            )
+        }
+
     @app.get("/state")
     def state():
         """Operational snapshot: watermark, per-probe progress, counters."""

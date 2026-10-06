@@ -21,6 +21,13 @@
 - **可复核性**：封存记录包含首个违规事件（按观测时刻排序，首个使窗口脱离
   NORMAL 的事件：自身剂量越限，或累计剂量在该事件处越限）以及封存瞬间两侧
   探头的进度（连续序号、进度时刻）与水位，可通过读取接口复查。
+- **辐照事件归并**：相邻且非 NORMAL 的已封存窗口自动汇成一次连续辐照事件，
+  避免同一次持续告警被拆成多条。引擎每次在既有事务内封存窗口后，按窗口起点
+  连续性推进唯一打开事件：`ELEVATED` / `CRITICAL` 窗口创建或扩展它，下一个
+  已封存的 `NORMAL` 窗口（包括水位跨过的空窗口）将其结束。事件记录起止窗口、
+  覆盖窗口数、累计剂量、期间峰值与最高风险等级，并区分 `ongoing`（仍在延续）
+  与 `ended`（已结束）。已结束的事件不会被迟到读数、重传或窗口读取改写；
+  并发封存与进程重启后仍只保留唯一一份累计结果。
 
 告警等级（阈值均可配置）：
 
@@ -56,6 +63,15 @@
 不可变的发布记录（`status: "sealed"`，含总剂量、峰值、等级、首个违规事件、
 `progress_at_seal`、`watermark_at_seal`、`sealed_at` 与窗口内事件清单）；未封存
 窗口返回明确标记的临时视图（`status: "open"`，`accepting` 表示是否仍接收数据）。
+
+### `GET /events` — 读取辐照事件
+
+按事件起点稳定排序列出辐照事件（可用 `?since=&until=` 按事件起点过滤）。
+每个事件包含 `start_window` / `end_window`（起止窗口）、`window_count`
+（覆盖窗口数）、`total_dose`（累计剂量）、`peak_dose`（期间峰值）、
+`max_level`（最高风险等级）、`status`（`ongoing` 仍在延续 / `ended`
+已结束）、`ended_by_window`（结束该事件的 NORMAL 窗口，未结束时为
+`null`）以及构成该事件的已封存窗口清单 `windows`。
 
 ### 其他
 
@@ -97,10 +113,11 @@ echo $?   # 0 = 全部通过
 
 1. **构建检查**：字节编译全部源码并导入应用模块；
 2. **代码测试**：`pytest`（重传幂等/冲突、乱序并入与封存、水位诚实性、
-   阈值与首个违规事件、重启恢复、并发唯一封存等 24 个用例）；
-3. **HTTP 冒烟**：对运行中的服务验证重传回放与冲突、乱序封存与迟到拒绝，
-   并通过 Docker socket **重启 app 容器**验证封存记录、幂等回放与水位
-   在重启后保持不变。
+   阈值与首个违规事件、辐照事件归并与截断、重启恢复、并发唯一封存等
+   32 个用例）；
+3. **HTTP 冒烟**：对运行中的服务验证重传回放与冲突、乱序封存与迟到拒绝、
+   辐照事件归并，并通过 Docker socket **重启 app 容器**验证封存记录、
+   事件记录、幂等回放与水位在重启后保持不变。
 
 重复验收前建议 `docker compose down -v` 清理数据卷（冒烟脚本按 `/state`
 中的探头进度续接序号，也可直接在既有数据上重跑）。
@@ -120,9 +137,9 @@ uvicorn app.main:app --port 8000
 app/
   config.py    # 环境变量配置
   models.py    # 请求模型（event_id/probe/seq/observed_at/dose）
-  storage.py   # SQLite（WAL）：读数、探头进度、封存窗口；单连接+锁串行化
-  engine.py    # 幂等摄入、连续序号进度、水位、同事务封存、等级与违规判定
-  main.py      # FastAPI：POST /readings、GET /windows…、/state、/health
+  storage.py   # SQLite（WAL）：读数、探头进度、封存窗口、辐照事件；单连接+锁串行化
+  engine.py    # 幂等摄入、连续序号进度、水位、同事务封存、等级与违规判定、事件归并
+  main.py      # FastAPI：POST /readings、GET /windows…、GET /events、/state、/health
 tests/         # pytest 验收用例
 scripts/
   smoke.py     # HTTP 冒烟（重传、乱序封存、重启恢复）

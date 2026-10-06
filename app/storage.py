@@ -49,6 +49,28 @@ CREATE TABLE IF NOT EXISTS windows (
     progress_json        TEXT NOT NULL,
     sealed_at_ms         INTEGER NOT NULL
 );
+
+-- One irradiation event per run of adjacent non-NORMAL sealed windows.
+-- Maintained incrementally inside the sealing transaction; ended events
+-- are never rewritten.
+CREATE TABLE IF NOT EXISTS irradiation_events (
+    event_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_window_ms    INTEGER NOT NULL,
+    end_window_ms      INTEGER NOT NULL,
+    window_count       INTEGER NOT NULL,
+    total_dose         REAL NOT NULL,
+    peak_dose          REAL NOT NULL,
+    max_level          TEXT NOT NULL,
+    status             TEXT NOT NULL,              -- 'ongoing' | 'ended'
+    ended_by_window_ms INTEGER,                    -- NORMAL window that closed it
+    created_at_ms      INTEGER NOT NULL,
+    updated_at_ms      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_irradiation_events_start
+    ON irradiation_events (start_window_ms);
+-- At most one open (still-accruing) event may exist at any time.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_irradiation_events_open
+    ON irradiation_events (status) WHERE status = 'ongoing';
 """
 
 
