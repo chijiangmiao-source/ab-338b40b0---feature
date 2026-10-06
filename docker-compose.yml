@@ -1,0 +1,57 @@
+name: radiation-monitor
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: radiation-monitor:runtime
+    environment:
+      # in-container listen port; the host-side port is HOST_PORT below
+      PORT: "8000"
+      DATABASE_PATH: /data/radiation.db
+      WINDOW_SECONDS: "300"
+      ALLOWED_LATENESS_SECONDS: "30"
+      ELEVATED_TOTAL: "100"
+      ELEVATED_PEAK: "40"
+      CRITICAL_TOTAL: "250"
+      CRITICAL_PEAK: "80"
+      PROBE_ALPHA: "alpha"
+      PROBE_BETA: "beta"
+    volumes:
+      - rad-data:/data
+    ports:
+      # configurable host port: HOST_PORT=9000 docker compose up app
+      - "${HOST_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','8000'), timeout=3)"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: radiation-monitor:verify
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_BASE_URL: http://app:8000
+      APP_SERVICE_NAME: app
+      DOCKER_SOCKET: /var/run/docker.sock
+    volumes:
+      # needed so the smoke test can restart the app container and prove
+      # that sealed windows and idempotency records survive a restart
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: "no"
+
+volumes:
+  rad-data:
