@@ -220,6 +220,21 @@ def main() -> int:
         "rejected late reading leaves the published summary untouched",
     )
 
+    # the sealed window is NORMAL (45 total, 20 peak): it forms
+    # no irradiation incident, and the read endpoints are live
+    status, _, incs = req("GET", "/incidents")
+    check(
+        status == 200 and incs.get("incidents") == [],
+        "normal sealed window forms no incident",
+        context=f"got {status} {incs}",
+    )
+    status, _, body = req("GET", f"/incidents/{w0_start}")
+    check(
+        status == 404 and body.get("detail", {}).get("error") == "no_incident",
+        "normal window lookup yields 404 no_incident",
+        context=f"got {status} {body}",
+    )
+
     # -- 3. recovery --------------------------------------------------------
     saved_window = window_after
     saved_ack = ack1

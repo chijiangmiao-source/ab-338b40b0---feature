@@ -21,6 +21,13 @@
 - **可复核性**：封存记录包含首个违规事件（按观测时刻排序，首个使窗口脱离
   NORMAL 的事件：自身剂量越限，或累计剂量在该事件处越限）以及封存瞬间两侧
   探头的进度（连续序号、进度时刻）与水位，可通过读取接口复查。
+- **连续辐照事件**：值班员查看已封存结果时，相邻且非 NORMAL 的窗口汇成一次
+  连续辐照事件，避免把同一次持续告警人工拆成多条。引擎在封存窗口的**同一事务**
+  内以窗口起点连续性推进**唯一**打开事件：ELEVATED/CRITICAL 窗口创建或扩展它，
+  下一个已封存的 NORMAL 窗口才将其结束（水位跨过的空窗口也按 NORMAL 参与截断）。
+  事件含起止窗口、覆盖窗口数、累计剂量、期间峰值与最高风险等级，并区分
+  **ongoing（仍在延续）**与 **ended（已结束）**。事件一旦结束即不可变，迟到读数、
+  重放或窗口读取都不会改写它。
 
 告警等级（阈值均可配置）：
 
@@ -60,7 +67,12 @@
 ### 其他
 
 - `GET /windows?since=&until=`：列出已封存窗口。
-- `GET /state`：水位、两探头进度、计数器与生效配置。
+- `GET /incidents?since=&until=&status=`：按事件起点稳定排序列出连续辐照事件，
+  每条含起止窗口、`status`（`ongoing`/`ended`）、覆盖窗口数、累计剂量、期间峰值、
+  `highest_level`、`closed_at` 与构成窗口清单。
+- `GET /incidents/{window_start}`：返回覆盖该窗口（自动对齐五分钟边界）的事件；
+  NORMAL 或未封存窗口不属于任何事件，返回 `404 no_incident`。
+- `GET /state`：水位、两探头进度、计数器（含进行中/已结束事件数）与生效配置。
 - `GET /health`：健康检查（含数据库探活），Compose 健康检查使用。
 
 ## 配置（环境变量）
@@ -97,7 +109,8 @@ echo $?   # 0 = 全部通过
 
 1. **构建检查**：字节编译全部源码并导入应用模块；
 2. **代码测试**：`pytest`（重传幂等/冲突、乱序并入与封存、水位诚实性、
-   阈值与首个违规事件、重启恢复、并发唯一封存等 24 个用例）；
+   阈值与首个违规事件、连续辐照事件归并与不可变性、重启恢复、并发唯一封存等
+   30 个用例）；
 3. **HTTP 冒烟**：对运行中的服务验证重传回放与冲突、乱序封存与迟到拒绝，
    并通过 Docker socket **重启 app 容器**验证封存记录、幂等回放与水位
    在重启后保持不变。
@@ -120,9 +133,9 @@ uvicorn app.main:app --port 8000
 app/
   config.py    # 环境变量配置
   models.py    # 请求模型（event_id/probe/seq/observed_at/dose）
-  storage.py   # SQLite（WAL）：读数、探头进度、封存窗口；单连接+锁串行化
-  engine.py    # 幂等摄入、连续序号进度、水位、同事务封存、等级与违规判定
-  main.py      # FastAPI：POST /readings、GET /windows…、/state、/health
+  storage.py   # SQLite（WAL）：读数、探头进度、封存窗口、连续辐照事件；单连接+锁串行化
+  engine.py    # 幂等摄入、连续序号进度、水位、同事务封存与事件归并、等级与违规判定
+  main.py      # FastAPI：POST /readings、GET /windows…、/incidents…、/state、/health
 tests/         # pytest 验收用例
 scripts/
   smoke.py     # HTTP 冒烟（重传、乱序封存、重启恢复）

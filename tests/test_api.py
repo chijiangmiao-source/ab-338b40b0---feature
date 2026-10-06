@@ -446,6 +446,229 @@ def test_concurrent_conflicting_event_has_single_winner(db_path):
     assert engine.state()["reading_count"] == 1
 
 
+# ------------------------------------------------------------- incidents
+
+def _drive_to(client, alpha_seq_times, beta_seq_times, dose=50.0):
+    """Submit contiguous readings for both probes; each item is
+    ``(observation_offset_seconds, dose)``.  Returns the final state."""
+    for seq, (t, d) in enumerate(alpha_seq_times, start=1):
+        client.post("/readings", json=reading(f"ia{seq}", "alpha", seq, t, d))
+    for seq, (t, d) in enumerate(beta_seq_times, start=1):
+        r = client.post(
+            "/readings", json=reading(f"ib{seq}", "beta", seq, t, d)
+        )
+        assert r.status_code == 200
+    return client
+
+
+def test_consecutive_elevated_and_critical_windows_form_one_incident(client):
+    # W0 [0,300)   ELEVATED (peak 50 >= 40)
+    # W1 [300,600) CRITICAL (dose 200 >= 80 peak)
+    # W2 [600,900) NORMAL  -> ends the incident
+    client = _drive_to(
+        client,
+        [(10, 50.0), (310, 5.0), (610, 5.0), (910, 5.0)],
+        [(20, 5.0), (320, 200.0), (620, 5.0), (920, 5.0)],
+    )
+    incs = client.get("/incidents").json()["incidents"]
+    assert len(incs) == 1
+    inc = incs[0]
+    assert inc["incident_start"] == ts(0)
+    assert inc["incident_end"] == ts(600)  # end of W1, the last alarm window
+    assert inc["status"] == "ended" and inc["ongoing"] is False
+    assert inc["closed_at"] == ts(900)  # closed when W2 (normal) sealed
+    assert inc["window_count"] == 2
+    assert inc["total_dose"] == 50 + 5 + 5 + 200  # only the two alarm windows
+    assert inc["peak_dose"] == 200.0
+    assert inc["highest_level"] == "CRITICAL"
+    assert [w["window_start"] for w in inc["windows"]] == [ts(0), ts(300)]
+    assert [w["level"] for w in inc["windows"]] == ["ELEVATED", "CRITICAL"]
+
+    # point lookup by any window inside the run
+    got = client.get(f"/incidents/{ts(310)}").json()
+    assert got["incident_start"] == ts(0)
+    assert got["window_count"] == 2
+    # a normal window not in any incident -> 404
+    assert client.get(f"/incidents/{ts(610)}").status_code == 404
+    assert client.get(f"/incidents/{ts(610)}").json()["detail"]["error"] == "no_incident"
+
+    st = client.get("/state").json()
+    assert st["ongoing_incident_count"] == 0
+    assert st["ended_incident_count"] == 1
+
+
+def test_normal_gap_splits_two_incidents(client):
+    # W0 elevated, W1 normal, W2 elevated, W3 normal -> two incidents
+    client = _drive_to(
+        client,
+        [(10, 50.0), (310, 1.0), (610, 50.0), (910, 1.0), (1210, 1.0)],
+        [(20, 1.0), (320, 1.0), (620, 50.0), (920, 1.0), (1220, 1.0)],
+    )
+    incs = client.get("/incidents").json()["incidents"]
+    # sorted stably by event start
+    assert [i["incident_start"] for i in incs] == [ts(0), ts(600)]
+    assert [i["incident_end"] for i in incs] == [ts(300), ts(900)]
+    assert all(i["status"] == "ended" for i in incs)
+    assert [i["highest_level"] for i in incs] == ["ELEVATED", "ELEVATED"]
+
+    # since/until bounds operate on the incident start
+    assert client.get(f"/incidents?since={ts(600)}").json()["incidents"] == [incs[1]]
+    only_ended = client.get("/incidents?status=ended").json()["incidents"]
+    assert len(only_ended) == 2
+    assert client.get("/incidents?status=bogus").status_code == 400
+
+
+def test_empty_window_crossed_by_watermark_truncates_incident(client):
+    # W0 elevated.  The frontier then jumps to 610: W1 (empty) seals as
+    # NORMAL and must end the incident even with no reading in it.
+    client = _drive_to(client, [(10, 50.0)], [(20, 50.0)])
+    # jump both probes past the end of W1 with no data in [300,600)
+    client.post("/readings", json=reading("ja2", "alpha", 2, 610, 1.0))
+    client.post("/readings", json=reading("jb2", "beta", 2, 620, 1.0))
+    incs = client.get("/incidents").json()["incidents"]
+    assert len(incs) == 1
+    assert incs[0]["status"] == "ended"
+    assert incs[0]["window_count"] == 1
+    assert incs[0]["closed_at"] == ts(600)
+    # the truncating normal window is not part of the incident
+    assert [w["window_start"] for w in incs[0]["windows"]] == [ts(0)]
+
+
+def test_open_incident_distinguished_from_ended(client):
+    # W0 elevated with no following sealed normal window yet
+    client = _drive_to(client, [(10, 50.0)], [(20, 50.0)])
+    client.post("/readings", json=reading("ja2", "alpha", 2, 310, 1.0))
+    client.post("/readings", json=reading("jb2", "beta", 2, 320, 1.0))
+    incs = client.get("/incidents").json()["incidents"]
+    assert len(incs) == 1
+    assert incs[0]["status"] == "ongoing" and incs[0]["ongoing"] is True
+    assert incs[0]["closed_at"] is None
+    assert incs[0]["incident_end"] == ts(300)
+    assert client.get("/incidents?status=ongoing").json()["incidents"] == incs
+    assert client.get("/incidents?status=ended").json()["incidents"] == []
+    st = client.get("/state").json()
+    assert st["ongoing_incident_count"] == 1
+    assert st["ended_incident_count"] == 0
+
+    # sealing the next normal window ends it; total stays as it was
+    client.post("/readings", json=reading("ja3", "alpha", 3, 610, 1.0))
+    client.post("/readings", json=reading("jb3", "beta", 3, 620, 1.0))
+    ended = client.get("/incidents").json()["incidents"][0]
+    assert ended["status"] == "ended"
+    assert ended["window_count"] == 1
+    assert ended["total_dose"] == incs[0]["total_dose"]
+
+
+def test_ended_incident_immutable_to_late_reading_and_replay(client):
+    client = _drive_to(
+        client,
+        [(10, 50.0), (310, 1.0), (610, 1.0)],
+        [(20, 50.0), (320, 1.0), (620, 1.0)],
+    )
+    before = client.get("/incidents").json()["incidents"]
+    # a late reading for an alarm window is rejected and changes nothing
+    r = client.post("/readings", json=reading("late", "alpha", 9, 100, 999.0))
+    assert r.status_code == 409 and r.json()["error"] == "window_sealed"
+    # an identical retransmission replays and likewise cannot rewrite
+    body = reading("ib1", "beta", 1, 20, 50.0)
+    rr = client.post("/readings", json=body)
+    assert rr.status_code == 200
+    assert rr.headers.get("x-idempotent-replay") == "true"
+    assert client.get("/incidents").json()["incidents"] == before
+
+
+def test_incidents_survive_restart_and_concurrency(db_path):
+    with TestClient(create_app(make_settings(db_path))) as c1:
+        c1.post("/readings", json=reading("ra1", "alpha", 1, 10, 50.0))
+        c1.post("/readings", json=reading("rb1", "beta", 1, 20, 50.0))
+        c1.post("/readings", json=reading("ra2", "alpha", 2, 310, 1.0))
+        ongoing_before = c1.post(
+            "/readings", json=reading("rb2", "beta", 2, 320, 50.0)
+        ).json()
+    with TestClient(create_app(make_settings(db_path))) as c2:
+        # the open incident recovered; W1 (still elevated) extends it,
+        # then W2 seals NORMAL and closes it
+        c2.post("/readings", json=reading("ra3", "alpha", 3, 610, 1.0))
+        c2.post("/readings", json=reading("rb3", "beta", 3, 620, 1.0))
+        c2.post("/readings", json=reading("ra4", "alpha", 4, 910, 1.0))
+        c2.post("/readings", json=reading("rb4", "beta", 4, 920, 1.0))
+        inc = c2.get("/incidents").json()["incidents"]
+        assert len(inc) == 1
+        assert inc[0]["incident_start"] == ts(0)
+        assert inc[0]["status"] == "ended"
+        assert inc[0]["window_count"] == 2
+        assert [w["level"] for w in inc[0]["windows"]] == [
+            "ELEVATED",
+            "ELEVATED",
+        ]
+
+    # -- concurrency: many threads sealing windows leave one coherent set
+    cdb = db_path.parent / "concurrent.db"
+    engine = _engine(cdb)
+    jobs = []
+    # 41 contiguous readings/probe at 30 s spacing -> frontier 1230 s, so
+    # windows [0,300)..[900,1200) seal.  The first three (t < 900) carry
+    # heavy dose (ELEVATED/CRITICAL); [900,1200) is NORMAL and closes.
+    for i in range(1, 42):
+        t = i * 30
+        jobs.append((f"ca{i}", "alpha", i, t))
+        jobs.append((f"cb{i}", "beta", i, t))
+    random.Random(3).shuffle(jobs)
+
+    def submit(job):
+        eid, probe, seq, t = job
+        return engine.submit(_reading_in(eid, probe, seq, t, 45.0 if t < 900 else 1.0))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(submit, jobs))
+
+    incs = engine.list_incidents()
+    assert len(incs) == 1
+    inc = incs[0]
+    assert inc["status"] == "ended"
+    assert inc["window_count"] == 3  # three contiguous elevated windows
+    assert inc["highest_level"] == "CRITICAL"
+    assert len(inc["windows"]) == 3
+    # exactly one persistent incident row, no duplicate aggregates
+    with engine.storage.read_txn() as conn:
+        rows = conn.execute("SELECT incident_start_ms FROM incidents").fetchall()
+        starts = [r["incident_start_ms"] for r in rows]
+        assert len(starts) == len(set(starts)) == 1
+
+
+# -------------------------------------------------------------------- misc
+
+def test_incident_reconcile_backfills_existing_sealed_windows(db_path):
+    # Seal windows with a running engine, then simulate an upgrade from a
+    # volume that has sealed windows but no incident rows.
+    settings = make_settings(db_path)
+    engine = Engine(Storage(settings.database_path), settings)
+    engine.submit(_reading_in("a1", "alpha", 1, 10, 50.0))
+    engine.submit(_reading_in("b1", "beta", 1, 20, 50.0))
+    engine.submit(_reading_in("a2", "alpha", 2, 310, 1.0))
+    engine.submit(_reading_in("b2", "beta", 2, 320, 200.0))
+    engine.submit(_reading_in("a3", "alpha", 3, 610, 1.0))
+    engine.submit(_reading_in("b3", "beta", 3, 620, 1.0))
+    engine.submit(_reading_in("a4", "alpha", 4, 910, 1.0))
+    engine.submit(_reading_in("b4", "beta", 4, 920, 1.0))
+    assert len(engine.list_incidents()) == 1
+    with engine.storage.write_txn() as conn:
+        conn.execute("DELETE FROM incidents")
+    assert engine.list_incidents() == []
+
+    # a fresh engine reconciles the pre-existing sealed windows ...
+    engine2 = Engine(Storage(settings.database_path), settings)
+    engine2.reconcile_incidents()
+    incs = engine2.list_incidents()
+    assert [i["window_count"] for i in incs] == [2]
+    assert incs[0]["highest_level"] == "CRITICAL"
+    assert incs[0]["status"] == "ended"
+
+    # ... and a second reconcile is a no-op (no duplicates, no rewrite)
+    engine2.reconcile_incidents()
+    assert engine2.list_incidents() == incs
+
+
 # -------------------------------------------------------------------- misc
 
 def test_window_lookup_aligns_to_boundary(client):

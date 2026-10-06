@@ -49,6 +49,24 @@ CREATE TABLE IF NOT EXISTS windows (
     progress_json        TEXT NOT NULL,
     sealed_at_ms         INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS incidents (
+    incident_start_ms     INTEGER PRIMARY KEY,
+    last_window_start_ms  INTEGER NOT NULL,
+    status               TEXT NOT NULL CHECK (status IN ('ongoing', 'ended')),
+    window_count        INTEGER NOT NULL,
+    total_dose           REAL NOT NULL,
+    peak_dose            REAL NOT NULL,
+    highest_level       TEXT NOT NULL,
+    closed_at_ms        INTEGER,
+    updated_at_ms         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents (status);
+-- At most one incident may be ongoing at any time, even under
+-- concurrent writers: every ongoing row carries the same literal
+-- status, so this unique index permits just one.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_one_open
+    ON incidents (status) WHERE status = 'ongoing';
 """
 
 

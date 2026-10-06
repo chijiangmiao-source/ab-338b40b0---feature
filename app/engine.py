@@ -15,6 +15,13 @@ Invariants enforced here:
   the watermark, and always inside the same persistent transaction as
   the reading that made it sealable.  ``window_start_ms`` is the primary
   key, so concurrent submissions and restarts leave exactly one record.
+* Incident continuity — consecutive sealed ELEVATED/CRITICAL windows form one
+  continuous irradiation incident.  The unique open incident is advanced
+  in window-start order inside the sealing transaction: an
+  ELEVATED/CRITICAL window opens or extends it, and the next sealed
+  NORMAL window (including an empty window the watermark crossed)
+  ends it.  Ended incidents are immutable; late readings, replays, and
+  window reads can never rewrite them.
 * Immutability — a reading whose observation falls into an already
   sealed window is rejected and changes nothing.
 """
@@ -272,7 +279,12 @@ class Engine:
                 "SELECT 1 FROM windows WHERE window_start_ms = ?", (w,)
             ).fetchone()
             if exists is None:
-                sealed.append(self._seal_one(conn, w, watermark_ms, now_ms))
+                summary = self._seal_one(conn, w, watermark_ms, now_ms)
+                sealed.append(summary)
+                # Advance the single open incident within the *same* transaction,
+                # so windows and incidents commit atomically — concurrency and
+                # restarts can never leave a half-advanced incident.
+                self._advance_incident(conn, w, summary, now_ms)
             w += s.window_ms
         return sealed
 
@@ -342,6 +354,104 @@ class Engine:
                     "dose": r["dose"],
                 }
         return None
+
+    # ---------------------------------------------------------------- incidents
+
+    def _open_incident(self, conn) -> object | None:
+        """The at-most-one incident that is still ``ongoing`` (or None)."""
+        return conn.execute(
+            "SELECT * FROM incidents WHERE status = 'ongoing'"
+        ).fetchone()
+
+    def _advance_incident(self, conn, window_start: int, summary: dict, now_ms: int) -> None:
+        """Fold one freshly sealed window into the incident stream.
+
+        Driven strictly in window-start order, inside the sealing
+        transaction.  An ELEVATED/CRITICAL window creates the unique open
+        incident or extends it; the next NORMAL window (empty
+        watermark-crossed windows included) closes it.  Windows are
+        sealed at most once, so this runs at most once per window;
+        nothing afterwards can reopen an ended incident.
+        """
+        level = summary["level"]
+        window_end = window_start + self.settings.window_ms
+        incident = self._open_incident(conn)
+        if level != "NORMAL":
+            if incident is None:
+                conn.execute(
+                    "INSERT INTO incidents (incident_start_ms, last_window_start_ms,"
+                    " status, window_count, total_dose, peak_dose, highest_level,"
+                    " closed_at_ms, updated_at_ms) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        window_start,
+                        window_start,
+                        "ongoing",
+                        1,
+                        summary["total_dose"],
+                        summary["peak_dose"],
+                        level,
+                        None,
+                        now_ms,
+                    ),
+                )
+            else:
+                highest = self._higher_level(incident["highest_level"], level)
+                conn.execute(
+                    "UPDATE incidents SET last_window_start_ms = ?,"
+                    " window_count = ?, total_dose = ?, peak_dose = ?,"
+                    " highest_level = ?, updated_at_ms = ?"
+                    " WHERE incident_start_ms = ? AND status = 'ongoing'",
+                    (
+                        window_start,
+                        incident["window_count"] + 1,
+                        incident["total_dose"] + summary["total_dose"],
+                        max(incident["peak_dose"], summary["peak_dose"]),
+                        highest,
+                        now_ms,
+                        incident["incident_start_ms"],
+                    ),
+                )
+        elif incident is not None:
+            # A NORMAL window terminates the contiguous run — including an
+            # empty window that the watermark merely crossed.
+            conn.execute(
+                "UPDATE incidents SET status = 'ended', closed_at_ms = ?,"
+                " updated_at_ms = ? WHERE incident_start_ms = ? AND status = 'ongoing'",
+                (window_end, now_ms, incident["incident_start_ms"]),
+            )
+
+    @staticmethod
+    def _higher_level(a: str, b: str) -> str:
+        rank = {"NORMAL": 0, "ELEVATED": 1, "CRITICAL": 2}
+        return a if rank[a] >= rank[b] else b
+
+    def reconcile_incidents(self) -> None:
+        """Backfill incident from already-sealed windows on startup.
+
+        Only runs when no incident row exists yet (fresh feature
+        rollout over a volume that already has sealed windows), and
+        replays the same in-order state machine.  Once any incident
+        exists, incremental sealing already keeps the table correct, so
+        this never rewrites or duplicates anything.
+        """
+        with self.storage.write_txn() as conn:
+            present = conn.execute("SELECT 1 FROM incidents LIMIT 1").fetchone()
+            if present is not None:
+                return
+            rows = conn.execute(
+                "SELECT window_start_ms, window_end_ms, total_dose,"
+                " peak_dose, event_count, level, sealed_at_ms"
+                " FROM windows ORDER BY window_start_ms"
+            ).fetchall()
+            now_ms = max((r["sealed_at_ms"] for r in rows), default=0)
+            for r in rows:
+                summary = {
+                    "total_dose": r["total_dose"],
+                    "peak_dose": r["peak_dose"],
+                    "event_count": r["event_count"],
+                    "level": r["level"],
+                }
+                self._advance_incident(conn, r["window_start_ms"], summary, now_ms)
 
     # ------------------------------------------------------------------ reads
 
@@ -460,18 +570,123 @@ class Engine:
             for r in rows
         ]
 
+    def list_incidents(
+        self,
+        since_ms: int | None = None,
+        until_ms: int | None = None,
+        status: str | None = None,
+    ) -> list[dict]:
+        """Incidents with their constituent windows, sorted by event start.
+
+        Only sealed windows are grouped, and ended incidents are never
+        recomputed here: every aggregate is read straight from the
+        immutable ``incidents`` row, so late readings and replays
+        cannot change a finished incident.
+        """
+        clauses, params = [], []
+        if since_ms is not None:
+            clauses.append("i.incident_start_ms >= ?")
+            params.append(since_ms)
+        if until_ms is not None:
+            clauses.append("i.incident_start_ms <= ?")
+            params.append(until_ms)
+        if status is not None:
+            clauses.append("i.status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        query = (
+            "SELECT i.*, w.window_start_ms, w.window_end_ms, w.level,"
+            " w.total_dose AS w_total_dose, w.peak_dose AS w_peak_dose,"
+            " w.event_count"
+            " FROM incidents i JOIN windows w"
+            " ON w.window_start_ms BETWEEN i.incident_start_ms"
+            " AND i.last_window_start_ms"
+            + where
+            + " ORDER BY i.incident_start_ms, w.window_start_ms"
+        )
+        with self.storage.read_txn() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return self._assemble_incidents(rows)
+
+    def get_incident(self, when_ms: int) -> dict | None:
+        """The incident covering the five-minute window containing ``when_ms``.
+
+        Returns the incident with its constituent windows, or ``None`` when
+        that window is not part of any incident (NORMAL, or
+        still unsealed).
+        """
+        s = self.settings
+        w = (when_ms // s.window_ms) * s.window_ms
+        query = (
+            "SELECT i.*, wn.window_start_ms, wn.window_end_ms, wn.level,"
+            " wn.total_dose AS w_total_dose, wn.peak_dose AS w_peak_dose,"
+            " wn.event_count"
+            " FROM incidents i JOIN windows wn"
+            " ON wn.window_start_ms BETWEEN i.incident_start_ms"
+            " AND i.last_window_start_ms"
+            " WHERE i.incident_start_ms <= ? AND i.last_window_start_ms >= ?"
+            " ORDER BY wn.window_start_ms"
+        )
+        with self.storage.read_txn() as conn:
+            rows = conn.execute(query, (w, w)).fetchall()
+        incidents = self._assemble_incidents(rows)
+        return incidents[0] if incidents else None
+
+    @staticmethod
+    def _assemble_incidents(rows) -> list[dict]:
+        incidents: dict[int, dict] = {}
+        order: list[int] = []
+        for r in rows:
+            start = r["incident_start_ms"]
+            if start not in incidents:
+                order.append(start)
+                incidents[start] = {
+                    "incident_start": iso(start),
+                    "incident_end": None,  # end of the last constituent window
+                    "status": r["status"],
+                    "ongoing": r["status"] == "ongoing",
+                    "window_count": r["window_count"],
+                    "total_dose": r["total_dose"],
+                    "peak_dose": r["peak_dose"],
+                    "highest_level": r["highest_level"],
+                    "closed_at": iso(r["closed_at_ms"]),
+                    "windows": [],
+                }
+            incidents[start]["windows"].append(
+                {
+                    "window_start": iso(r["window_start_ms"]),
+                    "window_end": iso(r["window_end_ms"]),
+                    "level": r["level"],
+                    "total_dose": r["w_total_dose"],
+                    "peak_dose": r["w_peak_dose"],
+                    "event_count": r["event_count"],
+                }
+            )
+        out = [incidents[k] for k in order]
+        for inc in out:
+            inc["incident_end"] = inc["windows"][-1]["window_end"]
+        return out
+
     def state(self) -> dict:
         with self.storage.read_txn() as conn:
             watermark_ms = self._watermark(conn)
             progress = self._progress(conn)
             sealed = conn.execute("SELECT COUNT(*) AS c FROM windows").fetchone()["c"]
             readings = conn.execute("SELECT COUNT(*) AS c FROM readings").fetchone()["c"]
+            ongoing = conn.execute(
+                "SELECT COUNT(*) AS c FROM incidents WHERE status = 'ongoing'"
+            ).fetchone()["c"]
+            ended = conn.execute(
+                "SELECT COUNT(*) AS c FROM incidents WHERE status = 'ended'"
+            ).fetchone()["c"]
         s = self.settings
         return {
             "watermark": iso(watermark_ms),
             "probes": progress,
             "sealed_window_count": sealed,
             "reading_count": readings,
+            "ongoing_incident_count": ongoing,
+            "ended_incident_count": ended,
             "config": {
                 "window_seconds": s.window_seconds,
                 "allowed_lateness_seconds": s.allowed_lateness_seconds,
